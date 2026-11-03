@@ -232,6 +232,12 @@ Chained entries order deeper graphs. If `infra` lists `operators` and
 
 Neither `dependents` nor `dependsOn` implies the other.
 
+`.spec.dependents` must not form a cycle, so the
+controller follows the chain of dependents. If the chain leads back to the
+object, the controller stops reconciling it and sets `Ready` to `False` with
+reason `DependentsCycle`, naming the objects in the cycle. Deletion stays
+blocked until someone breaks the cycle (manually deleting one of the dependents)
+
 #### Show why deletion is blocked
 
 While deletion is blocked, the controller sets `Ready` to
@@ -457,6 +463,19 @@ Applier controllers, such as a `Kustomization` and a `HelmRelease` depending
 on each other, cannot be detected by either controller. As with same-kind
 cycles today, all objects involved report `DependencyNotReady` until the
 cycle is broken by the user.
+
+`.spec.dependents` uses a new `DependentReference` type in
+`fluxcd/pkg/apis/meta`. It has no `readyExpr`, because a dependent is only
+checked for existence:
+
+```go
+type DependentReference struct {
+    APIVersion string `json:"apiVersion,omitempty"`
+    Kind       string `json:"kind,omitempty"`
+    Name       string `json:"name"`
+    Namespace  string `json:"namespace,omitempty"`
+}
+```
 
 ## Implementation History
 
