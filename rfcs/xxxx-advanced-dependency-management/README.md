@@ -25,6 +25,10 @@ and can be customized or replaced with the existing `readyExpr` CEL expression
 support. When the new fields are omitted, the behavior of `.spec.dependsOn` is
 identical to previous Flux versions.
 
+A new `.spec.dependents` field lists the objects that must be gone before an
+object's inventory is deleted, so a dependency graph can be torn down in
+reverse order.
+
 ## Motivation
 
 Today `.spec.dependsOn` only works between resources of the same kind: a
@@ -80,6 +84,8 @@ reduces the cognitive load for users moving between them.
   changes.
 - Share a single dependency-checking implementation between kustomize-controller
   and helm-controller so both controllers behave identically.
+- Delete a dependency graph in reverse order so an object outlives everything
+  that depends on it.
 
 ### Non-Goals
 
@@ -88,6 +94,7 @@ reduces the cognitive load for users moving between them.
 - Deciding the long-term future of the `AdditiveCELDependencyCheck` feature
   gate (retention, deprecation or removal). This RFC defines how the new
   fields interact with the gate as it exists today, and nothing more.
+- Ordering the pruning of individual resources inside one object's inventory.
 
 ## Proposal
 
@@ -189,6 +196,66 @@ When a dependency is not satisfied, the controller behaves as it does today:
 reconciliation is deferred, an event with reason `DependencyNotReady` is
 emitted, and the object is requeued at the dependency requeue interval.
 
+### Deletion ordering
+
+When a parent `Kustomization` prunes several `Kustomization` and `HelmRelease`
+objects at once, their controllers delete them in parallel. An operator can be
+uninstalled before its custom resources. Their finalizers never run, and the
+namespace hangs in `Terminating`.
+
+`.spec.dependents` lists the objects that must be gone before this one is 
+deleted. An entry takes `apiVersion`, `kind`, `name` and `namespace`, with
+the same defaults as `.spec.dependsOn`, and can point at any type, Flux or not.
+
+```yaml
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: postgres-operator
+  namespace: flux-system
+spec:
+  dependents:
+    - apiVersion: kustomize.toolkit.fluxcd.io/v1
+      kind: Kustomization
+      name: apps
+      namespace: flux-system
+```
+
+On deletion, before it garbage collects the inventory or uninstalls the
+release, the controller checks whether each dependent still exists. If one
+does, the controller keeps its finalizer
+and requeues after `--requeue-dependency`. Once all of them are gone, deletion
+runs as it does today.
+
+Chained entries order deeper graphs. If `infra` lists `operators` and
+`operators` lists `apps`, Flux deletes `apps`, then `operators`, then `infra`.
+
+Neither `dependents` nor `dependsOn` implies the other.
+
+#### Show why deletion is blocked
+
+While deletion is blocked, the controller sets `Ready` to
+`False` with reason `DependentsNotDeleted`, names the remaining dependents in
+the message, and emits a warning event with the same reason.
+
+To unblock it, delete the dependent, or remove its entry from the terminating
+object. Kubernetes accepts spec edits after the deletion timestamp is set. Expect
+to make that edit with `kubectl`, since the object is usually gone from Git.
+
+#### Keep waiting for termination opt-in
+
+By default, kustomize-controller removes a `Kustomization`'s
+finalizer right after it sends the delete requests. The dependency can then
+start deleting while the dependent's workloads are still terminating.
+
+To close that gap, set `.spec.deletionPolicy: WaitForTermination` on dependent
+`Kustomization` objects. A `HelmRelease` already waits unless
+`.spec.uninstall.disableWait` is `true`.
+
+`dependents` does not force either setting, the same way `dependsOn` does not
+force `healthChecks`. Deletion propagation, which Flux passes to the Kubernetes API as
+`.spec.uninstall.deletionPropagation`, is a separate setting.
+
 ### User Stories
 
 #### Depend on a HelmRelease from a Kustomization
@@ -237,6 +304,16 @@ Users can rely on the built-in check first and only reach for `readyExpr` when
 the resource status requires it, in the same way `.spec.healthCheckExprs`
 complements the built-in health checks (see RFC-0009).
 
+#### Delete apps before the operator they use
+
+> As a Flux user, I want my apps deleted before the database operator
+> they use, so the operator can process their finalizers and no namespace
+> hangs in `Terminating`.
+
+`postgres-operator` lists `apps` as a dependent.
+`apps` sets `.spec.deletionPolicy: WaitForTermination`, so Flux uninstalls the
+operator only after the last database is gone.
+
 ### Alternatives
 
 #### Keep the healthChecks workaround
@@ -275,6 +352,26 @@ Both changes are breaking: the former silently changes every existing
 rely on the gate. With this proposal, the two APIs expose the same fields with
 the same meaning, differing only in the `ready` default to avoid a breaking
 change.
+
+#### Derive dependents from `dependsOn`
+
+Reversing `dependsOn` edges only works while every edge stays within one kind.
+Once `dependsOn` crosses kinds, kustomize-controller cannot see a `HelmRelease`
+that depends on a `Kustomization`. An implicit wait would also stall deletion
+for users who never opted in. Explicit entries let a user drop one
+dependent during an incident.
+
+#### Use owner references with foreground deletion
+
+Foreground deletion gets the order right only by deleting the dependents along
+with their owner, so removing `infra` from Git would delete `apps` too. Owner
+references also cannot cross namespaces, and a namespaced object cannot own a
+cluster-scoped one.
+
+#### Require `WaitForTermination` with `dependents`
+
+Reverse ordering would work end to end by default. It would also couple two
+choices that the APIs keep separate for `dependsOn` and `healthChecks`.
 
 ## Design Details
 
