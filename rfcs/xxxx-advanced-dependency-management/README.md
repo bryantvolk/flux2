@@ -232,11 +232,8 @@ Chained entries order deeper graphs. If `infra` lists `operators` and
 
 Neither `dependents` nor `dependsOn` implies the other.
 
-`.spec.dependents` must not form a cycle, so the
-controller follows the chain of dependents. If the chain leads back to the
-object, the controller stops reconciling it and sets `Ready` to `False` with
-reason `DependentsCycle`, naming the objects in the cycle. Deletion stays
-blocked until someone breaks the cycle (manually deleting one of the dependents)
+`.spec.dependents` is an advanced API field, and users are responsible for
+ensuring that dependencies are defined correctly and do not introduce cycles.
 
 #### Show why deletion is blocked
 
